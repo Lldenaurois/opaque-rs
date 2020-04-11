@@ -2,8 +2,8 @@ extern crate rand;
 
 use secp256k1;
 
-mod client {
-    use crate::primitives::{Engine, Secret};
+pub mod client {
+    use crate::{server, primitives::{Engine, Secret}};
     use aes_gcm::Aes256Gcm;
     use aead::{Aead, NewAead, generic_array::GenericArray};
     use hex;
@@ -24,15 +24,20 @@ mod client {
     }
 
     impl Client {
-        pub fn login(&self) -> (Session, secp256k1::PublicKey, secp256k1::PublicKey) {
+        pub fn new(username: &str, password: &str) -> Self {
+            let engine = Engine::new();
+            Self{username: username.to_string(), password: password.to_string(), engine}
+        }
+
+        pub fn login(&self) -> (Session, server::LoginRequest) {
             let r = Engine::gen_key();
             let xu = Engine::gen_key();
             let alpha = self.engine.to_curve(self.password.as_bytes(), r.0.as_ref());
             let Xu = self.engine.exp(&xu);
-            (Session{ r, xu }, alpha, Xu)
+            (Session{ r, xu }, server::LoginRequest{alpha, Xu})
         }
 
-        pub fn complete(&self, session: Session, mut beta: secp256k1::PublicKey, Xs: secp256k1::PublicKey, c: Vec<u8>, As: Option<secp256k1::PublicKey>) -> Secret {
+        pub fn complete(&self, session: Session, mut login: server::LoginResponse, As: Option<secp256k1::PublicKey>) -> [u8; DIGEST_SIZE] {
             // Check that beta is not the generator
             let mut buf = [0u8; DIGEST_SIZE];
             let modulus = gmp::mpz::Mpz::from_str_radix("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16).expect("modulus");
@@ -43,15 +48,16 @@ mod client {
             if inv_string.len() % 2 != 0 {
                 inv_string = "0".to_string() + &inv_string;
             }
-            buf.copy_from_slice(&hex::decode(&inv_string).expect("inv to str"));
-            let invSecret = Secret(buf);
-            self.engine.custom_exp(&mut beta, &invSecret);
-            let rw = Engine::hash(self.password.as_bytes(), &beta);
+            let inv_buf = hex::decode(&inv_string).expect("inv to str");
+            buf[DIGEST_SIZE-inv_buf.len()..].copy_from_slice(&inv_buf);
+            let inv_secret = Secret(buf);
+            self.engine.custom_exp(&mut login.beta, &inv_secret);
+            let rw = Engine::hash(self.password.as_bytes(), &login.beta);
 
             let enc_key = GenericArray::clone_from_slice(rw.as_ref());
             let aead = Aes256Gcm::new(enc_key);
             let nonce = GenericArray::from_slice(b"unique_nonce");
-            let decryption = aead.encrypt(nonce, c.as_ref()).expect("Encryption Failure");
+            let decryption = aead.encrypt(nonce, login.ciphertext.as_ref()).expect("Encryption Failure");
 
             let mut pu_buf = [0u8; DIGEST_SIZE];
             pu_buf.copy_from_slice(&decryption[..DIGEST_SIZE]);
@@ -63,11 +69,11 @@ mod client {
             let Xu = self.engine.exp(&session.xu);
 
             let eu = Secret(Engine::hash("Server".as_bytes(), &Xu));
-            let es = Secret(Engine::hash(self.username.as_bytes(), &Xs));
+            let es = Secret(Engine::hash(self.username.as_bytes(), &login.Xs));
 
             let mut temp = secp256k1::PublicKey::from_slice(Ps.serialize().as_ref()).expect("temp");
             self.engine.custom_exp(&mut temp, &es);
-            let mut lhs = temp.combine(&Xs).expect("lhs");
+            let mut lhs = temp.combine(&login.Xs).expect("lhs");
 
             let mut rhs = secp256k1::PublicKey::from_slice(lhs.serialize().as_ref()).expect("rhs");
             self.engine.custom_exp(&mut lhs, &session.xu);
@@ -76,18 +82,17 @@ mod client {
 
             let out = lhs.combine(&rhs).expect("out");
 
-            Secret(Engine::hash("".as_bytes(), &out))
+            Engine::hash("".as_bytes(), &out)
         }
-
-
     }
 }
 
-mod server {
+pub mod server {
     use crate::{client , primitives::{Engine, Secret}};
     use std::collections::HashMap;
     use aes_gcm::Aes256Gcm;
     use aead::{Aead, NewAead, generic_array::GenericArray};
+    use std::convert::TryFrom;
 
     const DIGEST_SIZE: usize = 32;
     const CURVE_SIZE: usize = 33;
@@ -108,6 +113,70 @@ mod server {
     pub struct Server {
         pub(crate) backend: HashMap<String, File>,
         engine: Engine,
+    }
+
+    pub struct LoginRequest {
+        pub(crate) alpha: secp256k1::PublicKey,
+        pub(crate) Xu: secp256k1::PublicKey,
+    }
+
+    impl From<LoginRequest> for Vec<u8> {
+        fn from(login: LoginRequest) -> Self {
+            let mut buf = Vec::new();
+            buf.append(&mut login.alpha.serialize().to_vec());
+            buf.append(&mut login.Xu.serialize().to_vec());
+            buf
+        }
+    }
+
+    impl TryFrom<&Vec<u8>> for LoginRequest {
+        type Error = &'static str;
+
+        fn try_from(buf: &Vec<u8>) -> Result<Self, Self::Error> {
+            let buf_len = buf.len();
+            if buf_len >= 66 {
+                if let Ok(alpha) = secp256k1::PublicKey::from_slice(&buf[..33]) {
+                    if let Ok(Xu) = secp256k1::PublicKey::from_slice(&buf[33..66]) {
+                        return Ok(LoginRequest{ alpha, Xu });
+                    }
+                    return Err("Xu is not a valid public key");
+                }
+                return Err("Alpha is not a valid public key");
+            }
+            Err("LoginRequest must be exactly 66 bytes")
+        }
+    }
+
+    pub struct LoginResponse {
+        pub(crate) beta: secp256k1::PublicKey, 
+        pub(crate) Xs: secp256k1::PublicKey,
+        pub(crate) ciphertext: Vec<u8>,
+    }
+
+    impl From<LoginResponse> for Vec<u8> {
+        fn from(mut login: LoginResponse) -> Self {
+            let mut buf = Vec::new();
+            buf.append(&mut login.beta.serialize().to_vec());
+            buf.append(&mut login.Xs.serialize().to_vec());
+            buf.append(&mut login.ciphertext);
+            buf
+        }
+    }
+
+    impl TryFrom<&Vec<u8>> for LoginResponse {
+        type Error = &'static str;
+
+        fn try_from(buf: &Vec<u8>) -> Result<Self, Self::Error> {
+            if buf.len() >= 67 {
+                if let Ok(beta) = secp256k1::PublicKey::from_slice(&buf[..33]) {
+                    if let Ok(Xs) = secp256k1::PublicKey::from_slice(&buf[33..66]) {
+                        let ciphertext = buf[66..].to_vec();
+                        return Ok(LoginResponse{beta, Xs, ciphertext});
+                    }
+                }
+            }
+            Err("LoginResponse must be at least 67 bytes")
+        }
     }
 
     impl Server {
@@ -140,21 +209,22 @@ mod server {
             true
         }
 
-        pub fn process(&self, username: &str, mut alpha: secp256k1::PublicKey, Xu: secp256k1::PublicKey) -> Option<(Secret, Session, secp256k1::PublicKey, secp256k1::PublicKey, Vec<u8>)> {
+        pub fn process(&self, username: &str, login: &LoginRequest) -> Option<([u8; DIGEST_SIZE], Session, LoginResponse)> {
             // Check that alpha is not generator
             let username_str = username.to_string();
             if let Some(file) = self.backend.get(&username_str) {
+                let mut beta = secp256k1::PublicKey::from_slice(login.alpha.serialize().as_ref()).expect("beta");
                 let xs = Engine::gen_key();
                 let session = Session{ xs };
-                self.engine.custom_exp(&mut alpha, &file.ks);
+                self.engine.custom_exp(&mut beta, &file.ks);
                 let Xs = self.engine.exp(&session.xs);
 
                 let es = Secret(Engine::hash(username.as_bytes(), &Xs));
-                let eu = Secret(Engine::hash("Server".as_bytes(), &Xu));
+                let eu = Secret(Engine::hash("Server".as_bytes(), &login.Xu));
 
                 let mut temp = secp256k1::PublicKey::from_slice(file.Pu.serialize().as_ref()).expect("temp");
                 self.engine.custom_exp(&mut temp, &eu);
-                let mut lhs = temp.combine(&Xu).expect("lhs");
+                let mut lhs = temp.combine(&login.Xu).expect("lhs");
 
                 let mut rhs = secp256k1::PublicKey::from_slice(lhs.serialize().as_ref()).expect("rhs");
                 self.engine.custom_exp(&mut lhs, &session.xs);
@@ -163,18 +233,18 @@ mod server {
 
                 let out = lhs.combine(&rhs).expect("out");
 
-                let key = Secret(Engine::hash("".as_bytes(), &out));
+                let key = Engine::hash("".as_bytes(), &out);
 
                 let Ps = self.engine.exp(&file.ps);
 
-                return Some((key, session, alpha, Xs, file.c.clone()));
+                return Some((key, session, LoginResponse{ beta, Xs, ciphertext: file.c.clone()}));
             }
             None
         }
     }
 }
 
-mod primitives {
+pub mod primitives {
     use sha2::{Sha256, Digest};
     use rand::{self, RngCore, SeedableRng};
     use rand_chacha::{ChaChaRng};
@@ -273,15 +343,17 @@ mod tests {
             assert!(server.setup(&format!("{}", i), &format!("password{:?}", engine.result())));
         }
         for i in 0..100 {
-            let mut hashEngine = Sha256::new();
-            hashEngine.input(bytes.as_ref());
-            hashEngine.input([ i as u8 ].as_ref());
+            let mut hash_engine = Sha256::new();
+            hash_engine.input(bytes.as_ref());
+            hash_engine.input([ i as u8 ].as_ref());
             let engine = primitives::Engine::new();
-            let mut client = client::Client{ username: format!("{}", i), password: format!("password{:?}", hashEngine.result()), engine};
-            let (client_session, alpha, Xu) = client.login();
-            if let Some((server_secret, server_session, mut beta, Xs, c)) = server.process(&client.username, alpha, Xu) {
-                let client_secret = client.complete(client_session, beta, Xs, c, None);
-                assert!(server_secret.0.to_vec() == client_secret.0.to_vec());
+            let client = client::Client{ username: format!("{}", i), password: format!("password{:?}", hash_engine.result()), engine};
+            let (client_session, login_request) = client.login();
+            if let Some((server_secret, server_session, login_response)) = server.process(&client.username, &login_request) {
+                let client_secret = client.complete(client_session, login_response, None);
+                assert_eq!(hex::encode(server_secret.as_ref()), hex::encode(client_secret.as_ref()));
+            } else {
+                println!("Shit's not working");
             }
         }
     }
