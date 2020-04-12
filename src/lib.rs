@@ -99,11 +99,26 @@ pub mod server {
 
     #[derive(Hash, Debug)]
     pub struct File {
-        ks: Secret,
-        ps: Secret,
-        Ps: secp256k1::PublicKey,
-        Pu: secp256k1::PublicKey,
-        c: Vec<u8>,
+        pub(crate) ks: Secret,
+        pub(crate) ps: Secret,
+        pub(crate) Ps: secp256k1::PublicKey,
+        pub(crate) Pu: secp256k1::PublicKey,
+        pub(crate) c: Vec<u8>,
+    }
+
+    impl Clone for File {
+        fn clone(&self) -> Self {
+            let mut buf_ks = [0u8; DIGEST_SIZE];
+            buf_ks.copy_from_slice(self.ks.0.as_ref());
+            let ks = Secret(buf_ks);
+            let mut buf_ps = [0u8; DIGEST_SIZE];
+            let ps = Secret(buf_ps);
+            buf_ps.copy_from_slice(self.ps.0.as_ref());
+            let Ps = secp256k1::PublicKey::from_slice(self.Ps.serialize().as_ref()).unwrap();
+            let Pu = secp256k1::PublicKey::from_slice(self.Pu.serialize().as_ref()).unwrap();
+            let c = self.c.clone();
+            Self{ks, ps, Ps, Pu, c}
+        }
     }
 
     pub struct Session {
@@ -179,11 +194,19 @@ pub mod server {
         }
     }
 
+    impl Clone for Server {
+        fn clone(&self) -> Self {
+            let backend = self.backend.clone();
+            let engine = Engine::new();
+            Self{backend, engine}
+        }
+    }
+
     impl Server {
         pub fn new() -> Self {
             let backend = HashMap::new();
             let engine = Engine::new();
-            Self{ backend, engine }
+            Self{backend, engine}
         }
 
         pub fn setup(&mut self, username: &str, password: &str) -> bool {
